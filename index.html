@@ -1,0 +1,474 @@
+<!--
+  ThingSpeak 3-Day Comparison Dashboard
+  Channel: 1342827 (Raspberry Pi Temperature / Liverpool)
+  ---------------------------------------------------------------
+  HOW TO USE IN GOOGLE SITES:
+  1. Edit a Google Sites page -> Insert -> Embed -> Embed code.
+  2. Paste this ENTIRE file's contents into the box and click Insert.
+  3. Resize the embed box as needed. That's it.
+
+  WHAT IT DOES:
+  - Pulls the last 3 days of data from your ThingSpeak channel.
+  - Draws 3 line charts: Temperature, Pressure, Humidity.
+  - Each chart overlays 3 days on the SAME midnight-to-midnight
+    x-axis: 2 days ago (green), yesterday (blue), today (red, up
+    to the current time).
+  - Y-axis auto-scales to the data with a small padding margin.
+  - Auto-refreshes every 5 minutes, plus a manual refresh button.
+
+  THINGS YOU CAN EDIT (see CONFIG block below):
+  - CHANNEL_ID / READ_API_KEY if these ever change.
+  - STATION_TIMEZONE if the Pi isn't in the UK.
+  - The "unit" text for Pressure if your field is actually mmHg
+    rather than hPa (your channel's export page labels field 4 as
+    mmHg, but the built-in ThingSpeak widget for it says hPa -
+    check a couple of raw readings and set whichever is correct).
+-->
+<div id="ts-dashboard-root">
+  <style>
+    #ts-dashboard-root {
+      --ink: #1c2a24;
+      --paper: #fbfaf6;
+      --line: #dcd8cc;
+      --green: #2f7a4f;
+      --blue: #285e9e;
+      --red: #b83b3b;
+      --muted: #6b7268;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px 20px 22px;
+      max-width: 980px;
+      margin: 0 auto;
+      box-sizing: border-box;
+    }
+    #ts-dashboard-root * { box-sizing: border-box; }
+    .ts-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 10px;
+      margin-bottom: 6px;
+    }
+    .ts-title {
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+    }
+    .ts-sub {
+      font-size: 12.5px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .ts-refresh-btn {
+      font-size: 12px;
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    .ts-refresh-btn:hover { background: #f1efe6; }
+    .ts-legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 12.5px;
+      margin: 12px 0 4px;
+      color: var(--muted);
+    }
+    .ts-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .ts-swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+    .ts-chart-block { margin-top: 22px; }
+    .ts-chart-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .ts-chart-wrap { position: relative; height: 240px; }
+    .ts-status {
+      font-size: 12.5px;
+      color: var(--muted);
+      margin-top: 14px;
+      min-height: 16px;
+    }
+    .ts-status.error { color: var(--red); }
+  </style>
+
+  <div class="ts-header">
+    <div class="ts-title">Weather Station – 3 Day Comparison</div>
+    <div class="ts-sub">
+      <span id="ts-last-updated">Loading…</span>
+      <button class="ts-refresh-btn" id="ts-refresh-btn">Refresh now</button>
+    </div>
+  </div>
+
+  <div class="ts-legend">
+    <span><i class="ts-swatch" style="background:#2f7a4f"></i>2 days ago</span>
+    <span><i class="ts-swatch" style="background:#285e9e"></i>Yesterday</span>
+    <span><i class="ts-swatch" style="background:#b83b3b"></i>Today</span>
+  </div>
+
+  <div class="ts-chart-block">
+    <div class="ts-chart-title">Temperature (°C)</div>
+    <div class="ts-chart-wrap"><canvas id="ts-chart-temperature"></canvas></div>
+  </div>
+
+  <div class="ts-chart-block">
+    <div class="ts-chart-title">Pressure (hPa)</div>
+    <div class="ts-chart-wrap"><canvas id="ts-chart-pressure"></canvas></div>
+  </div>
+
+  <div class="ts-chart-block">
+    <div class="ts-chart-title">Humidity (%)</div>
+    <div class="ts-chart-wrap"><canvas id="ts-chart-humidity"></canvas></div>
+  </div>
+
+  <div class="ts-status" id="ts-status"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js" onerror="this.dataset.failed='1'; var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.min.js'; s.onload=function(){window.dispatchEvent(new Event('ts-chartjs-ready'));}; document.head.appendChild(s);"
+  onload="window.dispatchEvent(new Event('ts-chartjs-ready'));"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ===================== CONFIG =====================
+  var CHANNEL_ID       = "1342827";
+  var READ_API_KEY      = "HXL2XQ8VOZPRAFXK";
+  var STATION_TIMEZONE  = "Europe/London"; // Rails TZ name ThingSpeak uses
+  var INTERVAL_MIN      = 15;              // x-axis resolution, in minutes
+  var REFRESH_MS        = 5 * 60 * 1000;   // auto-refresh every 5 minutes
+
+  var FIELDS = {
+    temperature: { num: 1, canvasId: "ts-chart-temperature" },
+    pressure:    { num: 4, canvasId: "ts-chart-pressure" },
+    humidity:    { num: 5, canvasId: "ts-chart-humidity" }
+  };
+
+  var COLORS = { twoDaysAgo: "#2f7a4f", yesterday: "#285e9e", today: "#b83b3b" };
+  var SLOTS = (24 * 60) / INTERVAL_MIN; // e.g. 96 slots for 15-min steps
+
+  // Chart.js only draws axis lines on the left/bottom by default; this
+  // plugin draws a full rectangle around the plot area on all 4 sides.
+  var chartAreaBorderPlugin = {
+    id: "chartAreaBorder",
+    afterDraw: function (chart) {
+      var ctx = chart.ctx;
+      var area = chart.chartArea;
+      ctx.save();
+      ctx.strokeStyle = "#c9c4b2";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(
+        area.left + 0.5,
+        area.top + 0.5,
+        area.right - area.left - 1,
+        area.bottom - area.top - 1
+      );
+      ctx.restore();
+    }
+  };
+
+  var charts = {}; // canvasId -> Chart.js instance
+
+  // ===================== HELPERS =====================
+
+  // Build "HH:MM" labels for the shared 12am-12am x-axis, plus one trailing
+  // "24:00" boundary label so the line can reach the right-hand edge.
+  function buildLabels() {
+    var labels = [];
+    for (var i = 0; i < SLOTS; i++) {
+      var mins = i * INTERVAL_MIN;
+      var h = Math.floor(mins / 60);
+      var m = mins % 60;
+      labels.push(
+        (h < 10 ? "0" + h : h) + ":" + (m < 10 ? "0" + m : m)
+      );
+    }
+    labels.push("24:00");
+    return labels;
+  }
+
+  // Fixed x-axis ticks: only these 5 points are ever shown, regardless of
+  // the 15-min data resolution underneath.
+  var X_AXIS_TICKS = [
+    { value: 0, label: "00:00" },
+    { value: SLOTS * 0.25, label: "6:00" },
+    { value: SLOTS * 0.5, label: "12:00" },
+    { value: SLOTS * 0.75, label: "18:00" },
+    { value: SLOTS, label: "24:00" }
+  ];
+
+  // "Nice" integer step size for an axis spanning `range` units, aiming for
+  // roughly 5-6 labeled ticks (1, 2, 5, 10, 20, 50 ... x 10^n patterns).
+  function niceIntegerStep(range) {
+    if (!isFinite(range) || range <= 0) return 1;
+    var roughStep = range / 5;
+    var magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
+    var residual = roughStep / magnitude;
+    var niceResidual = residual > 5 ? 10 : residual > 2 ? 5 : residual > 1 ? 2 : 1;
+    return Math.max(1, Math.round(niceResidual * magnitude));
+  }
+
+  // Round-number tick values (integers only) that fall inside [rawMin, rawMax].
+  function integerTicksFor(rawMin, rawMax) {
+    var step = niceIntegerStep(rawMax - rawMin);
+    var first = Math.ceil(rawMin / step) * step;
+    var last = Math.floor(rawMax / step) * step;
+    var ticks = [];
+    for (var v = first; v <= last + 1e-9; v += step) ticks.push(Math.round(v));
+    if (!ticks.length) ticks.push(Math.round((rawMin + rawMax) / 2));
+    return ticks;
+  }
+
+  // Pull the calendar date + time-of-day straight out of the ISO string
+  // ThingSpeak returns (with its embedded UTC offset), so results match
+  // the STATION's wall clock regardless of the viewer's own timezone.
+  function parseStationDatetime(isoStr) {
+    var m = isoStr.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+    if (!m) return null;
+    var hour = +m[4], minute = +m[5], second = +m[6];
+    return {
+      dateKey: m[1] + "-" + m[2] + "-" + m[3],
+      minutesOfDay: hour * 60 + minute + second / 60
+    };
+  }
+
+  // Today's date (as the station sees it), independent of viewer timezone
+  function todayKeyForStation() {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: STATION_TIMEZONE,
+      year: "numeric", month: "2-digit", day: "2-digit"
+    }).format(new Date()); // en-CA formats as YYYY-MM-DD
+  }
+
+  function dateKeyMinusDays(key, daysBack) {
+    var d = new Date(key + "T00:00:00Z");
+    d.setUTCDate(d.getUTCDate() - daysBack);
+    return d.toISOString().slice(0, 10);
+  }
+
+  function slotIndexFor(minutesOfDay) {
+    return Math.min(SLOTS - 1, Math.round(minutesOfDay / INTERVAL_MIN));
+  }
+
+  // Compute a padded min/max so the line isn't jammed against the edges
+  function paddedRange(values) {
+    var nums = values.filter(function (v) { return v !== null && !isNaN(v); });
+    if (!nums.length) return { min: 0, max: 1 };
+    var min = Math.min.apply(null, nums);
+    var max = Math.max.apply(null, nums);
+    var range = max - min;
+    var pad = range > 0 ? range * 0.1 : (Math.abs(max) * 0.1 || 1);
+    return { min: min - pad, max: max + pad };
+  }
+
+  function setStatus(text, isError) {
+    var el = document.getElementById("ts-status");
+    el.textContent = text || "";
+    el.className = "ts-status" + (isError ? " error" : "");
+  }
+
+  // ===================== DATA -> CHART BUCKETS =====================
+
+  function bucketFeeds(feeds) {
+    var todayKey = todayKeyForStation();
+    var yesterdayKey = dateKeyMinusDays(todayKey, 1);
+    var twoDaysAgoKey = dateKeyMinusDays(todayKey, 2);
+
+    var buckets = {};
+    Object.keys(FIELDS).forEach(function (fieldName) {
+      buckets[fieldName] = {
+        today: new Array(SLOTS + 1).fill(null),
+        yesterday: new Array(SLOTS + 1).fill(null),
+        twoDaysAgo: new Array(SLOTS + 1).fill(null)
+      };
+    });
+
+    feeds.forEach(function (entry) {
+      var parsed = parseStationDatetime(entry.created_at);
+      if (!parsed) return;
+
+      var seriesKey;
+      if (parsed.dateKey === todayKey) seriesKey = "today";
+      else if (parsed.dateKey === yesterdayKey) seriesKey = "yesterday";
+      else if (parsed.dateKey === twoDaysAgoKey) seriesKey = "twoDaysAgo";
+      else return; // outside our 3-day window
+
+      var slot = slotIndexFor(parsed.minutesOfDay);
+
+      Object.keys(FIELDS).forEach(function (fieldName) {
+        var raw = entry["field" + FIELDS[fieldName].num];
+        if (raw === null || raw === undefined || raw === "") return;
+        var val = parseFloat(raw);
+        if (isNaN(val)) return;
+        buckets[fieldName][seriesKey][slot] = val;
+      });
+    });
+
+    // Completed days (yesterday, 2 days ago) should visually reach the
+    // 24:00 edge; "today" stops wherever the most recent reading is.
+    Object.keys(FIELDS).forEach(function (fieldName) {
+      ["yesterday", "twoDaysAgo"].forEach(function (seriesKey) {
+        var arr = buckets[fieldName][seriesKey];
+        if (arr[SLOTS - 1] !== null) arr[SLOTS] = arr[SLOTS - 1];
+      });
+    });
+
+    return { buckets: buckets, todayKey: todayKey, yesterdayKey: yesterdayKey, twoDaysAgoKey: twoDaysAgoKey };
+  }
+
+  // ===================== RENDERING =====================
+
+  function renderChart(fieldName, labels, seriesData) {
+    var canvas = document.getElementById(FIELDS[fieldName].canvasId);
+    var ctx = canvas.getContext("2d");
+
+    var allValues = seriesData.today.concat(seriesData.yesterday, seriesData.twoDaysAgo);
+    var yRange = paddedRange(allValues);
+    var rawNums = allValues.filter(function (v) { return v !== null && !isNaN(v); });
+    var rawMin = rawNums.length ? Math.min.apply(null, rawNums) : 0;
+    var rawMax = rawNums.length ? Math.max.apply(null, rawNums) : 1;
+    var yTicks = integerTicksFor(rawMin, rawMax);
+
+    var datasets = [
+      { label: "2 days ago", data: seriesData.twoDaysAgo, borderColor: COLORS.twoDaysAgo, backgroundColor: COLORS.twoDaysAgo },
+      { label: "Yesterday", data: seriesData.yesterday, borderColor: COLORS.yesterday, backgroundColor: COLORS.yesterday },
+      { label: "Today", data: seriesData.today, borderColor: COLORS.today, backgroundColor: COLORS.today }
+    ].map(function (ds) {
+      return Object.assign(ds, {
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 3,
+        spanGaps: true,
+        tension: 0.25
+      });
+    });
+
+    if (charts[fieldName]) {
+      charts[fieldName].data.labels = labels;
+      charts[fieldName].data.datasets = datasets;
+      charts[fieldName].options.scales.y.min = yRange.min;
+      charts[fieldName].options.scales.y.max = yRange.max;
+      charts[fieldName].options.scales.y.afterBuildTicks = function (axis) {
+        axis.ticks = yTicks.map(function (v) { return { value: v }; });
+      };
+      charts[fieldName].update();
+      return;
+    }
+
+    charts[fieldName] = new Chart(ctx, {
+      type: "line",
+      data: { labels: labels, datasets: datasets },
+      plugins: [chartAreaBorderPlugin],
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: false }, // we show our own legend above the charts
+          tooltip: {
+            callbacks: {
+              title: function (items) { return "Time: " + items[0].label; }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: { color: "#eae7db" },
+            ticks: { color: "#6b7268" },
+            afterBuildTicks: function (axis) {
+              axis.ticks = X_AXIS_TICKS.map(function (t) {
+                return { value: t.value, label: t.label };
+              });
+            }
+          },
+          y: {
+            min: yRange.min,
+            max: yRange.max,
+            grid: { color: "#eae7db" },
+            ticks: { color: "#6b7268" },
+            afterBuildTicks: function (axis) {
+              axis.ticks = yTicks.map(function (v) { return { value: v }; });
+            }
+          }
+        }
+      }
+    });
+  }
+
+  function renderAll(labels, buckets) {
+    Object.keys(FIELDS).forEach(function (fieldName) {
+      renderChart(fieldName, labels, buckets[fieldName]);
+    });
+  }
+
+  // ===================== FETCH =====================
+
+  function fetchAndRender() {
+    setStatus("Refreshing…", false);
+
+    var url = "https://api.thingspeak.com/channels/" + CHANNEL_ID + "/feeds.json"
+      + "?api_key=" + encodeURIComponent(READ_API_KEY)
+      + "&timezone=" + encodeURIComponent(STATION_TIMEZONE)
+      + "&days=3&results=8000";
+
+    fetch(url)
+      .then(function (res) {
+        if (!res.ok) throw new Error("ThingSpeak returned HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        var feeds = data && data.feeds ? data.feeds : [];
+        if (!feeds.length) {
+          setStatus("No data returned for the last 3 days.", true);
+          return;
+        }
+        var labels = buildLabels();
+        var result = bucketFeeds(feeds);
+
+        if (typeof Chart === "undefined") {
+          // Chart.js hasn't finished loading yet (e.g. primary CDN failed
+          // and the fallback is still fetching) - wait for it.
+          setStatus("Loading chart library…", false);
+          window.addEventListener("ts-chartjs-ready", function onReady() {
+            window.removeEventListener("ts-chartjs-ready", onReady);
+            renderAll(labels, result.buckets);
+            setStatus("", false);
+          }, { once: true });
+        } else {
+          renderAll(labels, result.buckets);
+          setStatus("", false);
+        }
+
+        document.getElementById("ts-last-updated").textContent =
+          "Last updated " + new Date().toLocaleTimeString();
+      })
+      .catch(function (err) {
+        setStatus("Couldn't load data: " + err.message, true);
+      });
+  }
+
+  document.getElementById("ts-refresh-btn").addEventListener("click", fetchAndRender);
+
+  fetchAndRender();
+  setInterval(fetchAndRender, REFRESH_MS);
+
+  // If Chart.js hasn't loaded from either CDN after 10s, say so plainly
+  // instead of leaving the panel stuck on "Loading chart library…".
+  setTimeout(function () {
+    if (typeof Chart === "undefined") {
+      setStatus("Chart library failed to load from either CDN. Check your network/firewall allows cdnjs.cloudflare.com or cdn.jsdelivr.net.", true);
+    }
+  }, 10000);
+})();
+</script>
